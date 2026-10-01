@@ -5,6 +5,10 @@ s = p.read_text(encoding="utf-8")
 
 checks = {
     "relay_override_fetches_original": "string raw_html = visit_url();" in s,
+    "raw_html_primary_parser": "boolean parse_raw_log(string html)" in s and "if (!parse_raw_log(raw_html))" in s,
+    "pstash_style_row_boundary": "<a\\\\s+[^>]*>" in s and "(?:<br\\\\s*/?>|\\\\r?\\\\n)" in s,
+    "loose_meat_deposit_verbs": "(?:contributed|added|deposited|put)" in s,
+    "stash_classified_by_action_shape": 'e.section = "Stash Activity";' in s,
     "uses_cached_historical_price": "historical_price(it)" in s,
     "uses_live_mall_fallback": "mall_price(it)" in s,
     "uses_autosell_floor": "autosell_price(it)" in s and 'source = "autosell-floor"' in s,
