@@ -1,6 +1,6 @@
 // clan_log.ash
 // KoLmafia relay override for clan_log.php
-// Clan Log Parser v0.2.1
+// Clan Log Parser v0.2.2
 //
 // Goals:
 //   - Render the clan activity log as a player-indexed audit dashboard.
@@ -17,10 +17,11 @@
 //   data/clan_logs/index.tsv
 //
 // Price source:
-//   historical_price(item) first; mall_price(item) only when no usable cached
-//   price exists. KoLmafia caches mall_price() per item for the session.
+//   historical_price(item) first; mall_price(item) when no usable cached quote;
+//   autosell_price(item) is the final non-market floor when the Mall has no quote.
+//   Results are cached per item for the page render.
 
-string CLAN_LOG_PARSER_VERSION = "0.2.1";
+string CLAN_LOG_PARSER_VERSION = "0.2.2";
 string AUDIT_DIR = "clan_logs/";
 string FLOOR_PREF = "clanLogAuditFloor";
 int DEFAULT_FLOOR = 500000;
@@ -37,6 +38,8 @@ record audit_event {
     float estimated_meat;
     boolean priced;
     string price_source;
+    int resolved_item_id;
+    string resolved_item_name;
     int occurrence;
     string raw;
 };
@@ -62,6 +65,8 @@ int[int] event_count;
 int[string] identical_line_count;
 int parsed_player_lines = 0;
 int unmatched_candidate_lines = 0;
+int[item] page_price_cache;
+string[item] page_price_source_cache;
 
 string trim_ws(string s) {
     matcher m = create_matcher("^\\s+|\\s+$", s);
@@ -135,37 +140,58 @@ void add_event(audit_event e) {
 
 audit_event price_stash_event(audit_event e) {
     // Clan logs render plural item names for quantities > 1. The two-argument
-    // to_item(string, int) form lets KoLmafia resolve those plural renderings
-    // against the quantity instead of requiring a singular item name.
+    // to_item(string, int) form is the same quantity-aware resolution strategy
+    // KoLmafia uses for plural result text.
     item it = to_item(e.item_name, e.quantity);
     if (it == $item[none]) {
         e.priced = false;
+        e.price_source = "unresolved";
         e.unit_price = 0;
         e.estimated_meat = 0.0;
         return e;
     }
 
-    int p = historical_price(it);
-    if (p > 0) {
-        e.price_source = "historical";
-    } else if (is_tradeable(it)) {
-        // A missing historical cache entry used to leave the dashboard at 0 Meat.
-        // Refresh only that unresolved item. KoLmafia limits mall_price() to one
-        // actual Mall search per item per session and caches later calls.
-        p = mall_price(it);
-        if (p > 0) e.price_source = "mall";
+    e.resolved_item_id = to_int(it);
+    e.resolved_item_name = to_string(it);
+
+    if (page_price_cache contains it) {
+        e.unit_price = page_price_cache[it];
+        e.price_source = page_price_source_cache[it];
+        e.priced = (e.unit_price > 0);
+        e.estimated_meat = e.priced ? e.unit_price * 1.0 * e.quantity : 0.0;
+        return e;
     }
+
+    int p = historical_price(it);
+    string source = "historical";
+
+    if (p <= 0 && is_tradeable(it)) {
+        // Current KoLmafia can return -1 when a Mall search finds no usable
+        // listings, not merely 0. Treat every non-positive result as no quote.
+        p = mall_price(it);
+        source = "mall";
+    }
+
+    if (p <= 0) {
+        // A missing Mall quote does not mean the item has no Meat value. Use the
+        // built-in autosell value as a clearly labelled floor rather than
+        // collapsing the dashboard total to zero.
+        p = autosell_price(it);
+        source = "autosell-floor";
+    }
+
+    if (p <= 0) {
+        p = 0;
+        source = "none";
+    }
+
+    page_price_cache[it] = p;
+    page_price_source_cache[it] = source;
 
     e.unit_price = p;
+    e.price_source = source;
     e.priced = (p > 0);
-
-    if (e.priced) {
-        e.estimated_meat = p * 1.0 * e.quantity;
-    } else {
-        e.price_source = "none";
-        e.estimated_meat = 0.0;
-    }
-
+    e.estimated_meat = e.priced ? p * 1.0 * e.quantity : 0.0;
     return e;
 }
 
@@ -192,6 +218,8 @@ void classify_and_add(string timestamp, string section, string name, int id, str
     e.estimated_meat = 0.0;
     e.priced = false;
     e.price_source = "none";
+    e.resolved_item_id = 0;
+    e.resolved_item_name = "";
     e.occurrence = next_occurrence(timestamp, section, id, action);
 
     if (section == "Stash Activity") {
@@ -364,7 +392,9 @@ void persist_player_history(int id) {
                      " | unit_price=" + e.unit_price +
                      " | estimated_meat=" + meat(e.estimated_meat) +
                      " | priced=" + e.priced +
-                     " | price_source=" + e.price_source;
+                     " | price_source=" + e.price_source +
+                     " | resolved_item_id=" + e.resolved_item_id +
+                     " | resolved_item=" + e.resolved_item_name;
         }
 
         history[key] = value;
@@ -453,7 +483,7 @@ void write_withdrawal_chart(int[int] ranked_ids, float threshold) {
     write("</div>");
 
     write("<div class='chart-wrap'><canvas id='withdrawalChart' aria-label='Estimated stash withdrawals over time'></canvas><div id='chartEmpty' class='chart-empty'>No priced withdrawal points for this selection.</div></div>");
-    write("<div class='chart-note'><span id='chartMeta'>Building withdrawal signal…</span><span>Review threshold: " + meat(threshold) + " Meat · price source: historical cache + Mall fallback</span></div>");
+    write("<div class='chart-note'><span id='chartMeta'>Building withdrawal signal…</span><span>Review threshold: " + meat(threshold) + " Meat · valuation: historical → Mall → autosell floor</span></div>");
     write("</div>");
     write("</section>");
 
@@ -555,12 +585,15 @@ void write_player_card(int id, player_summary p, float threshold, float max_take
 
             if (e.item_name != "") {
                 if (e.priced) {
-                    write("<br><span class='muted'>Resolved price: " +
+                    write("<br><span class='muted'>Resolved <b>" +
+                          safe(e.resolved_item_name) + "</b> (#" + e.resolved_item_id + ") · " +
                           meat(e.unit_price) + " x " + e.quantity +
                           " = <b>" + meat(e.estimated_meat) + " Meat</b> · " +
-                          safe(e.price_source) + " source</span>");
+                          safe(e.price_source) + "</span>");
                 } else {
-                    write("<br><span class='muted'>Parsed item: <b>" + e.quantity + " " + safe(e.item_name) + "</b>. No usable local historical mall price; excluded from total.</span>");
+                    write("<br><span class='muted'>Parsed item: <b>" + e.quantity + " " + safe(e.item_name) + "</b>. " +
+                          (e.resolved_item_id > 0 ? "Resolved as #" + e.resolved_item_id + " " + safe(e.resolved_item_name) + ", but no historical, Mall, or autosell value was available." : "KoLmafia could not resolve this display name to an item.") +
+                          "</span>");
                 }
             }
             write("</div>");
@@ -629,7 +662,7 @@ void main() {
     write("<div class='top'>");
     write("<a class='button' href='clan_log.php?raw=1'>Raw clan log</a>");
     write("<a class='button' href='clan_log.php'>Refresh</a>");
-    write("<span class='meta'>v" + CLAN_LOG_PARSER_VERSION + " · prices: historical cache + Mall fallback</span>");
+    write("<span class='meta'>v" + CLAN_LOG_PARSER_VERSION + " · valuation: historical → Mall → autosell floor</span>");
     write("</div></header>");
 
     write_parse_diagnostics();
