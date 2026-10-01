@@ -6,7 +6,11 @@ s = p.read_text(encoding="utf-8")
 checks = {
     "relay_override_fetches_original": "string raw_html = visit_url();" in s,
     "uses_cached_historical_price": "historical_price(it)" in s,
-    "no_live_mall_price": "mall_price(" not in s,
+    "uses_live_mall_fallback": "mall_price(it)" in s,
+    "plural_aware_item_resolution": "to_item(e.item_name, e.quantity)" in s,
+    "tracks_item_quantities": "items_taken" in s and "items_added" in s,
+    "two_column_player_grid": "player-card-grid" in s and "grid-template-columns:repeat(2,minmax(0,1fr))" in s,
+    "responsive_single_column_player_grid": ".player-card-grid{grid-template-columns:1fr}" in s,
     "no_send_kmail": "send_kmail(" not in s and 'cli_execute("send' not in s,
     "composer_only": "sendmessage.php?toid=" in s,
     "per_player_audit": '"player-" + id + ".tsv"' in s,
