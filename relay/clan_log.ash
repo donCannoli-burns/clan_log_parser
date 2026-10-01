@@ -1,6 +1,6 @@
 // clan_log.ash
 // KoLmafia relay override for clan_log.php
-// Clan Log Parser v0.2.0
+// Clan Log Parser v0.2.1
 //
 // Goals:
 //   - Render the clan activity log as a player-indexed audit dashboard.
@@ -17,10 +17,10 @@
 //   data/clan_logs/index.tsv
 //
 // Price source:
-//   historical_price(item), backed by KoLmafia's mallprices.txt cache.
-//   No live mall search is performed by this script.
+//   historical_price(item) first; mall_price(item) only when no usable cached
+//   price exists. KoLmafia caches mall_price() per item for the session.
 
-string CLAN_LOG_PARSER_VERSION = "0.2.0";
+string CLAN_LOG_PARSER_VERSION = "0.2.1";
 string AUDIT_DIR = "clan_logs/";
 string FLOOR_PREF = "clanLogAuditFloor";
 int DEFAULT_FLOOR = 500000;
@@ -36,6 +36,7 @@ record audit_event {
     int unit_price;
     float estimated_meat;
     boolean priced;
+    string price_source;
     int occurrence;
     string raw;
 };
@@ -145,12 +146,23 @@ audit_event price_stash_event(audit_event e) {
     }
 
     int p = historical_price(it);
+    if (p > 0) {
+        e.price_source = "historical";
+    } else if (is_tradeable(it)) {
+        // A missing historical cache entry used to leave the dashboard at 0 Meat.
+        // Refresh only that unresolved item. KoLmafia limits mall_price() to one
+        // actual Mall search per item per session and caches later calls.
+        p = mall_price(it);
+        if (p > 0) e.price_source = "mall";
+    }
+
     e.unit_price = p;
     e.priced = (p > 0);
 
     if (e.priced) {
         e.estimated_meat = p * 1.0 * e.quantity;
     } else {
+        e.price_source = "none";
         e.estimated_meat = 0.0;
     }
 
@@ -179,6 +191,7 @@ void classify_and_add(string timestamp, string section, string name, int id, str
     e.unit_price = 0;
     e.estimated_meat = 0.0;
     e.priced = false;
+    e.price_source = "none";
     e.occurrence = next_occurrence(timestamp, section, id, action);
 
     if (section == "Stash Activity") {
@@ -350,7 +363,8 @@ void persist_player_history(int id) {
                      " | item=" + e.item_name +
                      " | unit_price=" + e.unit_price +
                      " | estimated_meat=" + meat(e.estimated_meat) +
-                     " | priced=" + e.priced;
+                     " | priced=" + e.priced +
+                     " | price_source=" + e.price_source;
         }
 
         history[key] = value;
@@ -407,9 +421,9 @@ void write_style() {
     write("code{color:#302969;font-size:.92em}");
     write(".threshold-form{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.threshold-form label{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}");
     write(".chart-shell{position:relative;background:rgba(255,255,255,.20);border-top:3px double #777969;border-bottom:1px solid rgba(23,25,20,.28);padding:15px 16px 12px}.chart-toolbar{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,420px);gap:18px;align-items:end;margin-bottom:12px}.chart-toolbar p{margin:4px 0 0;color:#51544b;max-width:760px}.chart-controls{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}.chart-controls label{display:block;font-size:9px;letter-spacing:.13em;text-transform:uppercase;color:#74766d;margin-bottom:5px}.chart-controls select{width:100%;min-width:0}.index-link{align-self:end;white-space:nowrap}.chart-wrap{position:relative;height:330px}.chart-wrap canvas{display:block;width:100%;height:100%}.chart-empty{position:absolute;inset:0;display:none;place-items:center;color:var(--muted);font-style:italic}.chart-note{display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap;border-top:1px dotted var(--line);padding-top:9px;margin-top:8px;font:10px/1.5 var(--mono);color:var(--muted)}");
-    write(".player-ledgers-head{display:grid;grid-template-columns:160px minmax(0,1fr);gap:22px;align-items:end;padding:28px 0 10px;border-top:3px double #777969}.player-ledgers-head p{margin:0;color:var(--muted)}");
-    write("@media(max-width:880px){.masthead,.section-head,.player-ledgers-head,.chart-toolbar{grid-template-columns:1fr}.top{justify-content:flex-start}.ledger-grid{grid-template-columns:repeat(2,1fr)}.stat:nth-child(2){border-right:0}.stat:nth-child(-n+2){border-bottom:1px solid var(--line)}.chart-controls{grid-template-columns:1fr}.chart-wrap{height:285px}}");
-    write("@media(max-width:560px){.wrap{width:min(100% - 18px,1380px);padding-top:16px}.ledger-grid{grid-template-columns:1fr}.stat{border-right:0;border-bottom:1px solid var(--line)}.stat:last-child{border-bottom:0}.chart-wrap{height:250px}h1{font-size:46px}}");
+    write(".player-ledgers-head{display:grid;grid-template-columns:160px minmax(0,1fr);gap:22px;align-items:end;padding:28px 0 12px;border-top:3px double #777969}.player-ledgers-head p{margin:0;color:var(--muted)}.player-card-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}.player-card-grid>.card{margin:0;padding:18px 0}.player-card-grid .ledger-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.player-card-grid .stat:nth-child(2n){border-right:0}.player-card-grid .stat:nth-child(-n+2){border-bottom:1px solid var(--line)}");
+    write("@media(max-width:880px){.masthead,.section-head,.player-ledgers-head,.chart-toolbar{grid-template-columns:1fr}.top{justify-content:flex-start}.player-card-grid{grid-template-columns:1fr}.ledger-grid{grid-template-columns:repeat(2,1fr)}.stat:nth-child(2){border-right:0}.stat:nth-child(-n+2){border-bottom:1px solid var(--line)}.chart-controls{grid-template-columns:1fr}.chart-wrap{height:285px}}");
+    write("@media(max-width:560px){.wrap{width:min(100% - 18px,1380px);padding-top:16px}.ledger-grid,.player-card-grid .ledger-grid{grid-template-columns:1fr}.stat,.player-card-grid .stat{border-right:0;border-bottom:1px solid var(--line)}.stat:last-child,.player-card-grid .stat:last-child{border-bottom:0}.chart-wrap{height:250px}h1{font-size:46px}}");
     write("@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.button{transition:none}}");
     write("</style>");
 }
@@ -439,7 +453,7 @@ void write_withdrawal_chart(int[int] ranked_ids, float threshold) {
     write("</div>");
 
     write("<div class='chart-wrap'><canvas id='withdrawalChart' aria-label='Estimated stash withdrawals over time'></canvas><div id='chartEmpty' class='chart-empty'>No priced withdrawal points for this selection.</div></div>");
-    write("<div class='chart-note'><span id='chartMeta'>Building withdrawal signal…</span><span>Review threshold: " + meat(threshold) + " Meat · price source: local historical cache</span></div>");
+    write("<div class='chart-note'><span id='chartMeta'>Building withdrawal signal…</span><span>Review threshold: " + meat(threshold) + " Meat · price source: historical cache + Mall fallback</span></div>");
     write("</div>");
     write("</section>");
 
@@ -541,9 +555,10 @@ void write_player_card(int id, player_summary p, float threshold, float max_take
 
             if (e.item_name != "") {
                 if (e.priced) {
-                    write("<br><span class='muted'>Local cached price: " +
+                    write("<br><span class='muted'>Resolved price: " +
                           meat(e.unit_price) + " x " + e.quantity +
-                          " = <b>" + meat(e.estimated_meat) + " Meat</b></span>");
+                          " = <b>" + meat(e.estimated_meat) + " Meat</b> · " +
+                          safe(e.price_source) + " source</span>");
                 } else {
                     write("<br><span class='muted'>Parsed item: <b>" + e.quantity + " " + safe(e.item_name) + "</b>. No usable local historical mall price; excluded from total.</span>");
                 }
@@ -614,7 +629,7 @@ void main() {
     write("<div class='top'>");
     write("<a class='button' href='clan_log.php?raw=1'>Raw clan log</a>");
     write("<a class='button' href='clan_log.php'>Refresh</a>");
-    write("<span class='meta'>v" + CLAN_LOG_PARSER_VERSION + " · prices: local KoLmafia historical cache only</span>");
+    write("<span class='meta'>v" + CLAN_LOG_PARSER_VERSION + " · prices: historical cache + Mall fallback</span>");
     write("</div></header>");
 
     write_parse_diagnostics();
@@ -638,9 +653,11 @@ void main() {
 
     write("<div class='player-ledgers-head' id='player-ledgers'><div class='eyebrow'>Player ledgers</div><div><h2>Per-player activity</h2><p>The dropdown above is the player index; use it to filter the line, then jump directly to that member's ledger.</p></div></div>");
 
+    write("<div class='player-card-grid'>");
     foreach i, id in ranked_ids {
         write_player_card(id, players[id], threshold, max_taken);
     }
+    write("</div>");
 
     write("<section class='card'>");
     write("<div class='section-head'><div class='eyebrow'>Audit files</div><div><h2>Persistent records</h2>");
