@@ -5,6 +5,7 @@ A standalone KoLmafia relay override for `clan_log.php` that turns the clan acti
 ## What it does
 
 - Groups player-attributed clan activity by player ID.
+- Resolves stash item display text with KoLmafia's quantity-aware fuzzy item lookup first, then a bounded normalized-name fallback; weird KoL plurals remain supported without inventing arbitrary aliases.
 - Values stash additions and withdrawals with a three-step ladder: KoLmafia historical price first, current `mall_price(item)` when needed, then the item's built-in autosell value as a clearly labelled floor when no Mall quote is available.
 - Computes an accounting review threshold as `max(configured floor, 4 x median nonzero player withdrawal total)`; the default floor is 500,000 Meat.
 - Keeps per-player records in `data/clan_logs/player-<id>.tsv` and a current `data/clan_logs/index.tsv` rollup.
