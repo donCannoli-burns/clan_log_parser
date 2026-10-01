@@ -5,7 +5,7 @@ A standalone KoLmafia relay override for `clan_log.php` that turns the clan acti
 ## What it does
 
 - Groups player-attributed clan activity by player ID.
-- Prices stash additions and withdrawals with KoLmafia's **local historical mall-price cache** via `historical_price(item)`; it does not perform live Mall searches.
+- Prices stash additions and withdrawals from KoLmafia's historical cache first; when a resolved tradeable item has no usable cached value, it falls back to `mall_price(item)` so the dashboard can populate a current Meat estimate.
 - Computes an accounting review threshold as `max(configured floor, 4 x median nonzero player withdrawal total)`; the default floor is 500,000 Meat.
 - Keeps per-player records in `data/clan_logs/player-<id>.tsv` and a current `data/clan_logs/index.tsv` rollup.
 - Preserves repeated identical actions in the same minute using an occurrence ordinal instead of collapsing them.
@@ -47,13 +47,13 @@ If your build resolves relay scripts by basename, `verify clan_log.ash` is also 
 
 ## Safety / authority boundary
 
-This tool is an audit UI. It reads the clan log, reads cached prices, writes local audit files/preferences, and opens ordinary KoL links. It does **not** withdraw from the stash, distribute clan loot, alter clan membership, or send messages.
+This tool is an audit UI. It reads the clan log, reads cached prices, may perform a Mall price lookup for an unresolved cached price, writes local audit files/preferences, and opens ordinary KoL links. It does **not** withdraw from the stash, distribute clan loot, alter clan membership, or send messages.
 
 The KMail action intentionally stops at the human-operated composer.
 
 ## Pricing caveat
 
-`historical_price(item)` uses KoLmafia's locally cached mall-price history. Missing or unresolved prices remain visible as unpriced events and are excluded from Meat totals. The result is an estimate, not a valuation guarantee.
+`historical_price(item)` is used first. If it returns no usable value for a resolved tradeable item, the relay falls back to `mall_price(item)`. KoLmafia limits an actual Mall search to once per item per session and caches later calls. Items that still cannot be priced remain visible as unpriced events and are excluded from Meat totals. The result is an estimate, not a valuation guarantee.
 
 ## Updating / removing
 
