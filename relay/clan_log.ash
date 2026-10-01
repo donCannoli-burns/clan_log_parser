@@ -1,10 +1,11 @@
 // clan_log.ash
 // KoLmafia relay override for clan_log.php
-// Clan Log Parser v0.2.3
+// Clan Log Parser v0.3.0
 //
 // Goals:
 //   - Render the clan activity log as a player-indexed audit dashboard.
-//   - Estimate stash activity from KoLmafia's local mall price history only.
+//   - Parse player/action rows from raw clan_log.php HTML first, with text fallback.
+//   - Estimate stash item value from KoLmafia pricing data.
 //   - Preserve per-player records under data/clan_logs/.
 //   - Surface review candidates without making accusations.
 //   - Offer a human-click KMail composer link; never send KMail automatically.
@@ -21,7 +22,7 @@
 //   autosell_price(item) is the final non-market floor when the Mall has no quote.
 //   Results are cached per item for the page render.
 
-string CLAN_LOG_PARSER_VERSION = "0.2.3";
+string CLAN_LOG_PARSER_VERSION = "0.3.0";
 string AUDIT_DIR = "clan_logs/";
 string FLOOR_PREF = "clanLogAuditFloor";
 int DEFAULT_FLOOR = 500000;
@@ -65,6 +66,8 @@ audit_event[int, int] events;
 int[int] event_count;
 int[string] identical_line_count;
 int parsed_player_lines = 0;
+int raw_player_lines = 0;
+int text_fallback_lines = 0;
 int unmatched_candidate_lines = 0;
 string last_item_resolution_source = "unresolved";
 int[item] page_price_cache;
@@ -287,41 +290,42 @@ void classify_and_add(string timestamp, string section, string name, int id, str
     e.resolved_item_name = "";
     e.occurrence = next_occurrence(timestamp, section, id, action);
 
-    if (section == "Stash Activity") {
-        // Current KoL clan-log rows do not consistently end in punctuation.
-        // Accept both:
-        //   took 12 yams
-        //   took 12 yams.
-        matcher took = create_matcher("^took\\s+([0-9,]+)\\s+(.+?)[.]?$", action);
-        matcher added = create_matcher("^added\\s+([0-9,]+)\\s+(.+?)[.]?$", action);
-        matcher contrib = create_matcher("^contributed\\s+([0-9,]+)\\s+Meat[.]?$", action);
+    // Stash actions are classified by action shape rather than by a preceding
+    // section heading. KoL's clan-log presentation is loose enough that relying
+    // on heading/newline reconstruction can drop real rows.
+    matcher took = create_matcher("^took\\s+([0-9,]+)\\s+(.+?)[.]?$", action);
+    matcher meat_in = create_matcher("^(?:contributed|added|deposited|put)\\s+([0-9,]+)\\s+Meat(?:\\s+.*)?[.]?$", action);
+    matcher added = create_matcher("^added\\s+([0-9,]+)\\s+(.+?)[.]?$", action);
 
-        if (find(took)) {
-            e.quantity = parse_quantity(group(took, 1));
-            e.item_name = group(took, 2);
-            e = price_stash_event(e);
+    if (find(took)) {
+        e.section = "Stash Activity";
+        e.quantity = parse_quantity(group(took, 1));
+        e.item_name = group(took, 2);
+        e = price_stash_event(e);
 
-            players[id].stash_takes += 1;
-            players[id].items_taken += e.quantity;
-            if (e.priced) {
-                players[id].taken_value += e.estimated_meat;
-            } else {
-                players[id].unpriced_takes += 1;
-            }
-        } else if (find(added)) {
-            e.quantity = parse_quantity(group(added, 1));
-            e.item_name = group(added, 2);
-            e = price_stash_event(e);
+        players[id].stash_takes += 1;
+        players[id].items_taken += e.quantity;
+        if (e.priced) {
+            players[id].taken_value += e.estimated_meat;
+        } else {
+            players[id].unpriced_takes += 1;
+        }
+    } else if (find(meat_in)) {
+        e.section = "Stash Activity";
+        e.quantity = parse_quantity(group(meat_in, 1));
+        players[id].meat_contributed += e.quantity;
+    } else if (find(added)) {
+        e.section = "Stash Activity";
+        e.quantity = parse_quantity(group(added, 1));
+        e.item_name = group(added, 2);
+        e = price_stash_event(e);
 
-            players[id].stash_adds += 1;
-            players[id].items_added += e.quantity;
-            if (e.priced) {
-                players[id].added_value += e.estimated_meat;
-            } else {
-                players[id].unpriced_adds += 1;
-            }
-        } else if (find(contrib)) {
-            players[id].meat_contributed += parse_quantity(group(contrib, 1));
+        players[id].stash_adds += 1;
+        players[id].items_added += e.quantity;
+        if (e.priced) {
+            players[id].added_value += e.estimated_meat;
+        } else {
+            players[id].unpriced_adds += 1;
         }
     }
 
@@ -344,6 +348,41 @@ string normalized_section(string s) {
     if (starts_with(s, "Basement Stuff")) return "Basement Stuff";
     if (starts_with(s, "Lounge Activity")) return "Lounge Activity";
     return "Clan Activity Log";
+}
+
+boolean parse_raw_log(string html) {
+    // pStash's working clan-log exporter treats the raw HTML row shape as the
+    // stable boundary: timestamp, player anchor, action, <br>. Do that first.
+    matcher row_match = create_matcher(
+        "(\\d\\d/\\d\\d/\\d\\d,\\s*\\d\\d:\\d\\d(?:AM|PM))\\s*:\\s*<a\\s+[^>]*>([^<]+)</a>\\s*([^<]*?)(?:<br\\s*/?>|\\r?\\n)",
+        html
+    );
+
+    while (find(row_match)) {
+        string timestamp = trim_ws(group(row_match, 1));
+        string player_text = trim_ws(entity_decode(group(row_match, 2)));
+        string action = trim_ws(entity_decode(group(row_match, 3)));
+
+        matcher player_match = create_matcher("^(.*?)\\s+\\(#(\\d+)\\)$", player_text);
+        if (!find(player_match)) {
+            unmatched_candidate_lines += 1;
+            continue;
+        }
+
+        string name = trim_ws(group(player_match, 1));
+        int id = to_int(group(player_match, 2));
+        if (id <= 0 || name == "" || action == "") {
+            unmatched_candidate_lines += 1;
+            continue;
+        }
+
+        raw_player_lines += 1;
+        parsed_player_lines += 1;
+        classify_and_add(timestamp, "Clan Activity Log", name, id, action,
+                         timestamp + ": " + player_text + " " + action);
+    }
+
+    return raw_player_lines > 0;
 }
 
 void parse_log(string text) {
@@ -373,6 +412,7 @@ void parse_log(string text) {
             int id = to_int(group(line_match, 3));
             string action = group(line_match, 4);
             parsed_player_lines += 1;
+            text_fallback_lines += 1;
             classify_and_add(timestamp, section, name, id, action, s);
             continue;
         }
@@ -675,8 +715,9 @@ void write_parse_diagnostics() {
     if (parsed_player_lines > 0 && unmatched_candidate_lines == 0) return;
 
     write("<section class='card bad'><h2>Parser diagnostics</h2>");
-    write("<p>Parsed player-attributed lines: <b>" + parsed_player_lines + "</b>. ");
-    write("Date-looking lines not attributed: <b>" + unmatched_candidate_lines + "</b>.</p>");
+    write("<p>Parsed player-attributed lines: <b>" + parsed_player_lines + "</b> ");
+    write("(<b>" + raw_player_lines + "</b> raw HTML, <b>" + text_fallback_lines + "</b> text fallback). ");
+    write("Unmatched candidate rows: <b>" + unmatched_candidate_lines + "</b>.</p>");
 
     if (parsed_player_lines == 0) {
         write("<p><b>No audit files were updated.</b> The page format may have changed, the account may not have access, or the page may not be a clan log.</p>");
@@ -697,7 +738,12 @@ void main() {
         return;
     }
 
-    parse_log(html_to_text(raw_html));
+    // Raw HTML is authoritative for player/action rows, following the same
+    // acquisition pattern used by pStash. Only fall back to normalized text if
+    // the raw row matcher finds nothing at all.
+    if (!parse_raw_log(raw_html)) {
+        parse_log(html_to_text(raw_html));
+    }
 
     float floor_value = configured_floor(fields);
     float threshold = automatic_threshold(floor_value);
