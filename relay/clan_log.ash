@@ -1,6 +1,6 @@
 // clan_log.ash
 // KoLmafia relay override for clan_log.php
-// Clan Log Parser v0.2.2
+// Clan Log Parser v0.2.3
 //
 // Goals:
 //   - Render the clan activity log as a player-indexed audit dashboard.
@@ -21,7 +21,7 @@
 //   autosell_price(item) is the final non-market floor when the Mall has no quote.
 //   Results are cached per item for the page render.
 
-string CLAN_LOG_PARSER_VERSION = "0.2.2";
+string CLAN_LOG_PARSER_VERSION = "0.2.3";
 string AUDIT_DIR = "clan_logs/";
 string FLOOR_PREF = "clanLogAuditFloor";
 int DEFAULT_FLOOR = 500000;
@@ -38,6 +38,7 @@ record audit_event {
     float estimated_meat;
     boolean priced;
     string price_source;
+    string resolution_source;
     int resolved_item_id;
     string resolved_item_name;
     int occurrence;
@@ -65,6 +66,7 @@ int[int] event_count;
 int[string] identical_line_count;
 int parsed_player_lines = 0;
 int unmatched_candidate_lines = 0;
+string last_item_resolution_source = "unresolved";
 int[item] page_price_cache;
 string[item] page_price_source_cache;
 
@@ -87,6 +89,7 @@ string html_to_text(string html) {
     b = replace_string(b, "</h1>", "\n");
     b = replace_string(b, "</h2>", "\n");
     b = replace_string(b, "</h3>", "\n");
+    b = replace_string(b, "&nbsp;", " ");
 
     matcher tags = create_matcher("<[^>]*>", b.to_string());
     return entity_decode(replace_all(tags, ""));
@@ -121,6 +124,66 @@ int parse_quantity(string s) {
     return to_int(normalize_quantity(s));
 }
 
+string normalize_item_candidate(string s) {
+    buffer b = trim_ws(s);
+
+    // KoL pages and old relay transforms can disagree on whitespace and quote
+    // characters. Normalize presentation noise before asking KoLmafia to resolve.
+    b = replace_string(b, "&nbsp;", " ");
+    b = replace_string(b, "’", "'");
+    b = replace_string(b, "‘", "'");
+    b = replace_string(b, "“", "\"");
+    b = replace_string(b, "”", "\"");
+
+    matcher ws = create_matcher("\\s+", b.to_string());
+    string cleaned = trim_ws(replace_all(ws, " "));
+
+    // Our action parser already accepts an optional final period, but strip one
+    // here too so resolution stays robust if the source presentation changes.
+    if (length(cleaned) > 0 && ends_with(cleaned, ".")) {
+        cleaned = substring(cleaned, 0, length(cleaned) - 1);
+    }
+
+    return trim_ws(cleaned);
+}
+
+item resolve_stash_item(string display_name, int quantity) {
+    last_item_resolution_source = "unresolved";
+
+    string candidate = normalize_item_candidate(display_name);
+    if (candidate == "") return $item[none];
+
+    // First choice: quantity-aware lookup. KoLmafia's ItemDatabase uses plural
+    // aliases and substring matching here, including joke plurals such as
+    // "stanky hi meins" and "hi, hi meins (too cold, too cold)".
+    item it = to_item(candidate, quantity);
+    if (it != $item[none]) {
+        last_item_resolution_source = "quantity-fuzzy";
+        return it;
+    }
+
+    // Second choice: normal fuzzy item-name lookup. This catches display strings
+    // where the quantity/plural hint itself is what prevented resolution.
+    it = to_item(candidate);
+    if (it != $item[none]) {
+        last_item_resolution_source = "name-fuzzy";
+        return it;
+    }
+
+    // Final bounded fallback: only try a simple trailing-s removal. We do not
+    // invent arbitrary aliases or choose between ambiguous fuzzy matches.
+    if (quantity > 1 && length(candidate) > 1 && ends_with(candidate, "s")) {
+        string singularish = substring(candidate, 0, length(candidate) - 1);
+        it = to_item(singularish);
+        if (it != $item[none]) {
+            last_item_resolution_source = "trimmed-s-fuzzy";
+            return it;
+        }
+    }
+
+    return $item[none];
+}
+
 void ensure_player(int id, string name) {
     if (!(players contains id)) {
         players[id].id = id;
@@ -142,7 +205,8 @@ audit_event price_stash_event(audit_event e) {
     // Clan logs render plural item names for quantities > 1. The two-argument
     // to_item(string, int) form is the same quantity-aware resolution strategy
     // KoLmafia uses for plural result text.
-    item it = to_item(e.item_name, e.quantity);
+    item it = resolve_stash_item(e.item_name, e.quantity);
+    e.resolution_source = last_item_resolution_source;
     if (it == $item[none]) {
         e.priced = false;
         e.price_source = "unresolved";
@@ -218,6 +282,7 @@ void classify_and_add(string timestamp, string section, string name, int id, str
     e.estimated_meat = 0.0;
     e.priced = false;
     e.price_source = "none";
+    e.resolution_source = "unresolved";
     e.resolved_item_id = 0;
     e.resolved_item_name = "";
     e.occurrence = next_occurrence(timestamp, section, id, action);
@@ -393,6 +458,7 @@ void persist_player_history(int id) {
                      " | estimated_meat=" + meat(e.estimated_meat) +
                      " | priced=" + e.priced +
                      " | price_source=" + e.price_source +
+                     " | resolution_source=" + e.resolution_source +
                      " | resolved_item_id=" + e.resolved_item_id +
                      " | resolved_item=" + e.resolved_item_name;
         }
@@ -587,6 +653,7 @@ void write_player_card(int id, player_summary p, float threshold, float max_take
                 if (e.priced) {
                     write("<br><span class='muted'>Resolved <b>" +
                           safe(e.resolved_item_name) + "</b> (#" + e.resolved_item_id + ") · " +
+                          safe(e.resolution_source) + " · " +
                           meat(e.unit_price) + " x " + e.quantity +
                           " = <b>" + meat(e.estimated_meat) + " Meat</b> · " +
                           safe(e.price_source) + "</span>");
