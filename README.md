@@ -58,8 +58,8 @@ The KMail action intentionally stops at the human-operated composer.
 ## Updating / removing
 
 ```text
-git update
+git update donCannoli-burns-clan_log_parser-main
 git delete donCannoli-burns-clan_log_parser-main
 ```
 
-Use `git list` as the authority for the installed project identifier on your KoLmafia build.
+Depending on how KoLmafia identifies a default-branch checkout on your build, `git list` is the authority for the installed project identifier.
