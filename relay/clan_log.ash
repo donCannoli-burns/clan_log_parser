@@ -1,6 +1,6 @@
 // clan_log.ash
 // KoLmafia relay override for clan_log.php
-// Clan Log Parser v0.1.0
+// Clan Log Parser v0.2.0
 //
 // Goals:
 //   - Render the clan activity log as a player-indexed audit dashboard.
@@ -20,7 +20,7 @@
 //   historical_price(item), backed by KoLmafia's mallprices.txt cache.
 //   No live mall search is performed by this script.
 
-string CLAN_LOG_PARSER_VERSION = "0.1.0";
+string CLAN_LOG_PARSER_VERSION = "0.2.0";
 string AUDIT_DIR = "clan_logs/";
 string FLOOR_PREF = "clanLogAuditFloor";
 int DEFAULT_FLOOR = 500000;
@@ -46,6 +46,8 @@ record player_summary {
     int events;
     int stash_takes;
     int stash_adds;
+    int items_taken;
+    int items_added;
     int unpriced_takes;
     int unpriced_adds;
     float taken_value;
@@ -92,6 +94,17 @@ string safe(string s) {
     return entity_encode(s);
 }
 
+string js_safe(string s) {
+    buffer b = s;
+    b = replace_string(b, "\\", "\\\\");
+    b = replace_string(b, "\"", "\\\"");
+    b = replace_string(b, "\n", "\\n");
+    b = replace_string(b, "\r", "");
+    b = replace_string(b, "<", "\\u003c");
+    b = replace_string(b, ">", "\\u003e");
+    return b.to_string();
+}
+
 string normalize_quantity(string s) {
     buffer b = s;
     b = replace_string(b, ",", "");
@@ -120,9 +133,10 @@ void add_event(audit_event e) {
 }
 
 audit_event price_stash_event(audit_event e) {
-    // Keep item resolution conservative. If KoLmafia cannot resolve the clan-log
-    // item text, retain the event but exclude it from the Meat estimate.
-    item it = to_item(e.item_name);
+    // Clan logs render plural item names for quantities > 1. The two-argument
+    // to_item(string, int) form lets KoLmafia resolve those plural renderings
+    // against the quantity instead of requiring a singular item name.
+    item it = to_item(e.item_name, e.quantity);
     if (it == $item[none]) {
         e.priced = false;
         e.unit_price = 0;
@@ -135,7 +149,7 @@ audit_event price_stash_event(audit_event e) {
     e.priced = (p > 0);
 
     if (e.priced) {
-        e.estimated_meat = p * e.quantity;
+        e.estimated_meat = p * 1.0 * e.quantity;
     } else {
         e.estimated_meat = 0.0;
     }
@@ -168,9 +182,13 @@ void classify_and_add(string timestamp, string section, string name, int id, str
     e.occurrence = next_occurrence(timestamp, section, id, action);
 
     if (section == "Stash Activity") {
-        matcher took = create_matcher("^took ([0-9,]+) (.+)\\.$", action);
-        matcher added = create_matcher("^added ([0-9,]+) (.+)\\.$", action);
-        matcher contrib = create_matcher("^contributed ([0-9,]+) Meat\\.$", action);
+        // Current KoL clan-log rows do not consistently end in punctuation.
+        // Accept both:
+        //   took 12 yams
+        //   took 12 yams.
+        matcher took = create_matcher("^took\\s+([0-9,]+)\\s+(.+?)[.]?$", action);
+        matcher added = create_matcher("^added\\s+([0-9,]+)\\s+(.+?)[.]?$", action);
+        matcher contrib = create_matcher("^contributed\\s+([0-9,]+)\\s+Meat[.]?$", action);
 
         if (find(took)) {
             e.quantity = parse_quantity(group(took, 1));
@@ -178,6 +196,7 @@ void classify_and_add(string timestamp, string section, string name, int id, str
             e = price_stash_event(e);
 
             players[id].stash_takes += 1;
+            players[id].items_taken += e.quantity;
             if (e.priced) {
                 players[id].taken_value += e.estimated_meat;
             } else {
@@ -189,6 +208,7 @@ void classify_and_add(string timestamp, string section, string name, int id, str
             e = price_stash_event(e);
 
             players[id].stash_adds += 1;
+            players[id].items_added += e.quantity;
             if (e.priced) {
                 players[id].added_value += e.estimated_meat;
             } else {
@@ -349,8 +369,10 @@ void persist_index(float threshold) {
         index_rows[key] =
             "events=" + p.events +
             " | stash_takes=" + p.stash_takes +
+            " | items_taken=" + p.items_taken +
             " | taken_value=" + meat(p.taken_value) +
             " | stash_adds=" + p.stash_adds +
+            " | items_added=" + p.items_added +
             " | added_value=" + meat(p.added_value) +
             " | meat_contributed=" + meat(p.meat_contributed) +
             " | review=" + (p.taken_value >= threshold && p.taken_value > 0.0);
@@ -363,22 +385,107 @@ void persist_index(float threshold) {
 
 void write_style() {
     write("<style>");
-    write("body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:16px}");
-    write("a{color:#7dd3fc}.wrap{max-width:1200px;margin:auto}");
-    write(".top{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:14px}");
-    write(".card{background:#191919;border:1px solid #333;border-radius:10px;padding:12px;margin:10px 0}");
-    write(".warn{border-color:#f59e0b}.bad{border-color:#ef4444}");
-    write(".muted{color:#aaa}.num{font-variant-numeric:tabular-nums}");
-    write(".barbg{height:14px;background:#2a2a2a;border-radius:999px;overflow:hidden;margin:6px 0}");
-    write(".bar{height:100%;background:#60a5fa}.bar.warnbar{background:#f59e0b}");
-    write(".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}");
-    write(".stat{background:#141414;border:1px solid #2c2c2c;border-radius:8px;padding:8px}");
-    write("details{margin-top:8px}summary{cursor:pointer}.event{padding:6px 0;border-top:1px solid #292929}");
-    write(".take{color:#fca5a5}.add{color:#86efac}.pill{display:inline-block;border:1px solid #444;border-radius:999px;padding:2px 7px;margin-left:6px}");
-    write("input{background:#0d0d0d;color:#eee;border:1px solid #444;border-radius:6px;padding:5px}");
-    write("button,.button{display:inline-block;background:#222;color:#fff;border:1px solid #555;border-radius:7px;padding:6px 10px;text-decoration:none}");
-    write("code{color:#d8b4fe}");
+    write(":root{--paper:#eee9da;--paper2:#e4decc;--ink:#171914;--muted:#66685d;--line:#a7a693;--accent:#6d5bd0;--accent2:#5547ab;--warn:#8b433b;--add:#43634c;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;--serif:Georgia,'Times New Roman',serif}");
+    write("*{box-sizing:border-box}");
+    write("html{background:var(--paper);color:var(--ink);scroll-behavior:smooth}");
+    write("body{margin:0;background:linear-gradient(rgba(23,25,20,.04) 1px,transparent 1px),var(--paper);background-size:100% 30px,auto;color:var(--ink);font-family:var(--serif);line-height:1.5}");
+    write("a{color:var(--accent2)}.wrap{width:min(1380px,calc(100% - 34px));margin:0 auto;padding:28px 0 70px}");
+    write(".masthead{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:24px;align-items:end;padding:14px 0 22px;border-bottom:3px double #777969}");
+    write(".kicker,.eyebrow,.micro,.meta,.button,select,label,.pill,summary,code{font-family:var(--mono)}");
+    write(".kicker{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent2);margin-bottom:8px}");
+    write("h1{font-size:clamp(42px,7vw,86px);line-height:.9;letter-spacing:-.055em;font-weight:500;margin:0}h2{font-size:clamp(25px,3vw,38px);font-weight:500;letter-spacing:-.035em;margin:0 0 12px}");
+    write(".top{display:flex;gap:14px;flex-wrap:wrap;align-items:center;justify-content:flex-end}.button{display:inline-block;border:0;border-bottom:2px solid var(--accent);background:transparent;color:#302969;padding:7px 2px 5px;text-decoration:none;font-size:10px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer}.button:hover,.button:focus-visible{padding-left:7px;padding-right:7px;outline:1px dotted var(--accent)}");
+    write(".muted{color:var(--muted)}.num{font-variant-numeric:tabular-nums}.meta{font-size:10px;letter-spacing:.05em;color:var(--muted)}");
+    write(".card,.chart-section{background:transparent;border:0;border-top:1px solid var(--line);padding:22px 0;margin:0}.card.warn{border-top:3px double var(--warn)}.card.bad{border-top:3px double var(--warn)}");
+    write(".section-head{display:grid;grid-template-columns:160px minmax(0,1fr);gap:22px;align-items:start;margin-bottom:16px}.eyebrow{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#74766d;padding-top:7px}");
+    write(".ledger-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-top:1px solid var(--line);border-bottom:1px solid var(--line)}");
+    write(".stat{padding:13px 14px;background:rgba(255,255,255,.18);border-right:1px solid var(--line);min-height:78px}.stat:last-child{border-right:0}.stat b{font-weight:500}.stat .num{font-size:21px;color:#302969}");
+    write(".barbg{height:5px;background:rgba(23,25,20,.10);overflow:hidden;margin:12px 0 16px}.bar{height:100%;background:var(--accent)}.bar.warnbar{background:var(--warn)}");
+    write("details{margin-top:14px;border-top:1px dotted var(--line);padding-top:10px}summary{cursor:pointer;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#4f514a}");
+    write(".event{padding:10px 0;border-top:1px dotted rgba(23,25,20,.18)}.event:first-of-type{margin-top:8px}.take{color:#7e342e}.add{color:#35563e}.pill{display:inline-block;border-bottom:1px solid currentColor;padding:1px 0;margin-left:7px;font-size:9px;letter-spacing:.09em;text-transform:uppercase;color:var(--warn)}");
+    write("input,select{background:rgba(255,255,255,.22);color:var(--ink);border:1px solid #999988;border-radius:0;padding:8px 9px}input:focus,select:focus{outline:2px solid rgba(109,91,208,.25);border-color:var(--accent)}");
+    write("code{color:#302969;font-size:.92em}");
+    write(".threshold-form{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.threshold-form label{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}");
+    write(".chart-shell{position:relative;background:rgba(255,255,255,.20);border-top:3px double #777969;border-bottom:1px solid rgba(23,25,20,.28);padding:15px 16px 12px}.chart-toolbar{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,420px);gap:18px;align-items:end;margin-bottom:12px}.chart-toolbar p{margin:4px 0 0;color:#51544b;max-width:760px}.chart-controls{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}.chart-controls label{display:block;font-size:9px;letter-spacing:.13em;text-transform:uppercase;color:#74766d;margin-bottom:5px}.chart-controls select{width:100%;min-width:0}.index-link{align-self:end;white-space:nowrap}.chart-wrap{position:relative;height:330px}.chart-wrap canvas{display:block;width:100%;height:100%}.chart-empty{position:absolute;inset:0;display:none;place-items:center;color:var(--muted);font-style:italic}.chart-note{display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap;border-top:1px dotted var(--line);padding-top:9px;margin-top:8px;font:10px/1.5 var(--mono);color:var(--muted)}");
+    write(".player-ledgers-head{display:grid;grid-template-columns:160px minmax(0,1fr);gap:22px;align-items:end;padding:28px 0 10px;border-top:3px double #777969}.player-ledgers-head p{margin:0;color:var(--muted)}");
+    write("@media(max-width:880px){.masthead,.section-head,.player-ledgers-head,.chart-toolbar{grid-template-columns:1fr}.top{justify-content:flex-start}.ledger-grid{grid-template-columns:repeat(2,1fr)}.stat:nth-child(2){border-right:0}.stat:nth-child(-n+2){border-bottom:1px solid var(--line)}.chart-controls{grid-template-columns:1fr}.chart-wrap{height:285px}}");
+    write("@media(max-width:560px){.wrap{width:min(100% - 18px,1380px);padding-top:16px}.ledger-grid{grid-template-columns:1fr}.stat{border-right:0;border-bottom:1px solid var(--line)}.stat:last-child{border-bottom:0}.chart-wrap{height:250px}h1{font-size:46px}}");
+    write("@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.button{transition:none}}");
     write("</style>");
+}
+
+
+void write_withdrawal_chart(int[int] ranked_ids, float threshold) {
+    float total_taken = 0.0;
+    int total_items_taken = 0;
+    foreach id, p in players {
+        total_taken += p.taken_value;
+        total_items_taken += p.items_taken;
+    }
+
+    write("<section class='chart-section' id='withdrawal-signal'>");
+    write("<div class='chart-shell'>");
+    write("<div class='chart-toolbar'>");
+    write("<div><div class='eyebrow'>Withdrawal signal / priced item flow</div>");
+    write("<h2>Stash withdrawal line</h2>");
+    write("<p>Daily estimated Meat removed from the stash. Use the player index to isolate one member; sharp peaks stay visually obvious instead of being buried in a ranked card list.</p></div>");
+    write("<div class='chart-controls'><div><label for='playerSelect'>Player index</label><select id='playerSelect'>");
+    write("<option value='0'>All players — " + meat(total_taken) + " Meat / " + total_items_taken + " item(s)</option>");
+    foreach i, id in ranked_ids {
+        player_summary p = players[id];
+        write("<option value='" + id + "'>" + safe(p.name) + " (#" + id + ") — " + meat(p.taken_value) + " Meat / " + p.items_taken + " item(s)</option>");
+    }
+    write("</select></div><a class='button index-link' id='playerJump' href='#player-ledgers'>Browse ledgers ↓</a></div>");
+    write("</div>");
+
+    write("<div class='chart-wrap'><canvas id='withdrawalChart' aria-label='Estimated stash withdrawals over time'></canvas><div id='chartEmpty' class='chart-empty'>No priced withdrawal points for this selection.</div></div>");
+    write("<div class='chart-note'><span id='chartMeta'>Building withdrawal signal…</span><span>Review threshold: " + meat(threshold) + " Meat · price source: local historical cache</span></div>");
+    write("</div>");
+    write("</section>");
+
+    write("<script>");
+    write("(function(){");
+    write("const events=[");
+    boolean first = true;
+    foreach id, p in players {
+        int n = event_count[id];
+        if (n > 0) {
+            for i from 0 to n - 1 {
+                audit_event e = events[id, i];
+                if (starts_with(e.action, "took ") && e.item_name != "") {
+                    if (!first) write(",");
+                    first = false;
+                    write("{t:\"" + js_safe(e.timestamp) + "\",playerId:" + id +
+                          ",player:\"" + js_safe(e.player_name) + "\",value:" + round(e.estimated_meat) +
+                          ",priced:" + e.priced + ",item:\"" + js_safe(e.item_name) + "\",qty:" + e.quantity + "}");
+                }
+            }
+        }
+    }
+    write("];");
+    write("const threshold=" + round(threshold) + ";");
+    write("const canvas=document.getElementById('withdrawalChart'),select=document.getElementById('playerSelect'),meta=document.getElementById('chartMeta'),empty=document.getElementById('chartEmpty'),jump=document.getElementById('playerJump');");
+    write("if(!canvas||!select)return;const ctx=canvas.getContext('2d');");
+    write("function money(n){if(n>=1e9)return (n/1e9).toFixed(n>=1e10?0:1)+'B';if(n>=1e6)return (n/1e6).toFixed(n>=1e7?0:1)+'M';if(n>=1e3)return (n/1e3).toFixed(n>=1e4?0:1)+'K';return Math.round(n).toLocaleString();}");
+    write("function dayNum(k){const a=k.split('/');return Date.UTC(2000+Number(a[2]),Number(a[0])-1,Number(a[1]));}");
+    write("function keyFromMs(ms){const d=new Date(ms),m=String(d.getUTCMonth()+1).padStart(2,'0'),day=String(d.getUTCDate()).padStart(2,'0'),y=String(d.getUTCFullYear()).slice(-2);return m+'/'+day+'/'+y;}");
+    write("function labelDay(k){const a=k.split('/'),d=new Date(Date.UTC(2000+Number(a[2]),Number(a[0])-1,Number(a[1])));return d.toLocaleDateString(undefined,{month:'short',day:'numeric',timeZone:'UTC'});}");
+    write("function niceMax(v){if(v<=0)return 1;const p=Math.pow(10,Math.floor(Math.log10(v))),n=v/p;const step=n<=1?1:n<=2?2:n<=5?5:10;return step*p;}");
+    write("function series(){const id=Number(select.value)||0,scoped=events.filter(e=>!id||e.playerId===id),priced=scoped.filter(e=>e.priced&&e.value>0),unpriced=scoped.filter(e=>!e.priced),map=new Map();priced.forEach(e=>{const k=e.t.slice(0,8);map.set(k,(map.get(k)||0)+e.value);});const keys=[...map.keys()].sort((a,b)=>dayNum(a)-dayNum(b));if(!keys.length)return {rows:[],priced:priced.length,unpriced:unpriced.length};const rows=[];for(let ms=dayNum(keys[0]);ms<=dayNum(keys[keys.length-1]);ms+=86400000){const k=keyFromMs(ms);rows.push({k,value:map.get(k)||0});}return {rows,priced:priced.length,unpriced:unpriced.length};}");
+    write("function draw(){const s=series(),rows=s.rows,box=canvas.getBoundingClientRect(),w=Math.max(320,box.width),h=Math.max(220,box.height),dpr=Math.max(1,window.devicePixelRatio||1);canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);empty.style.display=rows.length?'none':'grid';const id=Number(select.value)||0,option=select.options[select.selectedIndex],name=id?option.text.split(' (#')[0]:'All players';jump.href=id?'#player-'+id:'#player-ledgers';jump.textContent=id?'Open '+name+' ledger ↓':'Browse player ledgers ↓';if(!rows.length){meta.textContent=name+' · 0 priced withdrawals · '+s.unpriced+' unpriced';return;}");
+    write("const pad={l:66,r:18,t:24,b:44},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b,maxData=Math.max(...rows.map(r=>r.value)),yMax=niceMax(maxData*1.08||1);ctx.font='10px ui-monospace,SFMono-Regular,Menlo,monospace';ctx.textBaseline='middle';");
+    write("for(let i=0;i<=4;i++){const y=pad.t+ph*(i/4),v=yMax*(1-i/4);ctx.beginPath();ctx.strokeStyle='rgba(23,25,20,.16)';ctx.lineWidth=1;ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();ctx.fillStyle='#66685d';ctx.textAlign='right';ctx.fillText(money(v),pad.l-9,y);}");
+    write("const count=rows.length,x=(i)=>pad.l+(count===1?pw/2:(i/(count-1))*pw),y=(v)=>pad.t+ph-(v/yMax)*ph;");
+    write("const tickCount=Math.min(6,count);for(let j=0;j<tickCount;j++){const i=tickCount===1?0:Math.round(j*(count-1)/(tickCount-1));ctx.fillStyle='#66685d';ctx.textAlign='center';ctx.textBaseline='top';ctx.fillText(labelDay(rows[i].k),x(i),h-pad.b+10);}");
+    write("if(threshold>0&&threshold<=yMax){const ty=y(threshold);ctx.save();ctx.setLineDash([5,5]);ctx.strokeStyle='rgba(139,67,59,.75)';ctx.beginPath();ctx.moveTo(pad.l,ty);ctx.lineTo(w-pad.r,ty);ctx.stroke();ctx.restore();ctx.fillStyle='#8b433b';ctx.textAlign='left';ctx.textBaseline='bottom';ctx.fillText('review '+money(threshold),pad.l+5,ty-3);}");
+    write("ctx.beginPath();rows.forEach((r,i)=>{const xx=x(i),yy=y(r.value);if(i===0)ctx.moveTo(xx,yy);else ctx.lineTo(xx,yy);});ctx.strokeStyle='#6d5bd0';ctx.lineWidth=2;ctx.stroke();");
+    write("rows.forEach((r,i)=>{if(r.value<=0)return;ctx.beginPath();ctx.fillStyle='#eee9da';ctx.strokeStyle='#6d5bd0';ctx.lineWidth=1.5;ctx.arc(x(i),y(r.value),3.2,0,Math.PI*2);ctx.fill();ctx.stroke();});");
+    write("let peak=rows[0],peakIndex=0;rows.forEach((r,i)=>{if(r.value>peak.value){peak=r;peakIndex=i;}});if(peak.value>0){const px=x(peakIndex),py=y(peak.value);ctx.beginPath();ctx.fillStyle='#6d5bd0';ctx.arc(px,py,4.8,0,Math.PI*2);ctx.fill();ctx.fillStyle='#302969';ctx.textAlign=px>w*.72?'right':'left';ctx.textBaseline='bottom';ctx.fillText(money(peak.value)+' · '+labelDay(peak.k),px+(px>w*.72?-8:8),Math.max(14,py-7));}");
+    write("const thresholdNote=threshold>yMax?' · review threshold off-scale':'';meta.textContent=name+' · peak '+money(peak.value)+' Meat on '+labelDay(peak.k)+' · '+s.priced+' priced withdrawal action(s) · '+s.unpriced+' unpriced'+thresholdNote;");
+    write("}");
+    write("select.addEventListener('change',draw);window.addEventListener('resize',draw);draw();");
+    write("})();");
+    write("</script>");
 }
 
 void write_player_card(int id, player_summary p, float threshold, float max_taken) {
@@ -400,11 +507,11 @@ void write_player_card(int id, player_summary p, float threshold, float max_take
     if (flagged) write(" warnbar");
     write("' style='width:" + round(pct) + "%'></div></div>");
 
-    write("<div class='grid'>");
-    write("<div class='stat'><b>Estimated taken</b><br><span class='num'>" + meat(p.taken_value) + " Meat</span></div>");
-    write("<div class='stat'><b>Estimated added</b><br><span class='num'>" + meat(p.added_value) + " Meat</span></div>");
+    write("<div class='ledger-grid'>");
+    write("<div class='stat'><b>Estimated taken</b><br><span class='num'>" + meat(p.taken_value) + " Meat</span><br><span class='meta'>" + p.items_taken + " item(s) / " + p.stash_takes + " withdrawal action(s)</span></div>");
+    write("<div class='stat'><b>Estimated added</b><br><span class='num'>" + meat(p.added_value) + " Meat</span><br><span class='meta'>" + p.items_added + " item(s) / " + p.stash_adds + " addition action(s)</span></div>");
     write("<div class='stat'><b>Direct Meat contributed</b><br><span class='num'>" + meat(p.meat_contributed) + " Meat</span></div>");
-    write("<div class='stat'><b>Stash actions</b><br>" + p.stash_takes + " took / " + p.stash_adds + " added</div>");
+    write("<div class='stat'><b>Unpriced item actions</b><br><span class='num'>" + (p.unpriced_takes + p.unpriced_adds) + "</span><br><span class='meta'>" + p.unpriced_takes + " took / " + p.unpriced_adds + " added</span></div>");
     write("</div>");
 
     if (p.unpriced_takes > 0 || p.unpriced_adds > 0) {
@@ -438,7 +545,7 @@ void write_player_card(int id, player_summary p, float threshold, float max_take
                           meat(e.unit_price) + " x " + e.quantity +
                           " = <b>" + meat(e.estimated_meat) + " Meat</b></span>");
                 } else {
-                    write("<br><span class='muted'>No usable local mall price; excluded from total.</span>");
+                    write("<br><span class='muted'>Parsed item: <b>" + e.quantity + " " + safe(e.item_name) + "</b>. No usable local historical mall price; excluded from total.</span>");
                 }
             }
             write("</div>");
@@ -496,61 +603,51 @@ void main() {
     }
     sort ranked_ids by -players[value].taken_value;
 
-    write("<!doctype html><html><head><meta charset='utf-8'>");
+    write("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
     write("<title>Clan Activity Audit</title>");
     write_style();
     write("</head><body><div class='wrap'>");
 
-    write("<h1>Clan Activity Audit</h1>");
+    write("<header class='masthead'><div>");
+    write("<div class='kicker'>04C / Archival editorial · canonical guardrails</div>");
+    write("<h1>Clan Activity Audit</h1></div>");
     write("<div class='top'>");
     write("<a class='button' href='clan_log.php?raw=1'>Raw clan log</a>");
     write("<a class='button' href='clan_log.php'>Refresh</a>");
-    write("<span class='muted'>v" + CLAN_LOG_PARSER_VERSION + " | prices: local KoLmafia historical cache only</span>");
-    write("</div>");
+    write("<span class='meta'>v" + CLAN_LOG_PARSER_VERSION + " · prices: local KoLmafia historical cache only</span>");
+    write("</div></header>");
 
     write_parse_diagnostics();
 
-    write("<section class='card'>");
-    write("<h2>Review threshold</h2>");
-    write("<p><b>" + meat(threshold) + " Meat</b> - the larger of your configured floor and 4x the median nonzero player withdrawal total. ");
-    write("If fewer than three players have priced withdrawals, the configured floor is used.</p>");
-
-    write("<form method='GET' action='clan_log.php'>");
-    write("Configured floor: <input name='floor' value='" + meat(floor_value) + "' size='14'> ");
-    write("<button type='submit'>Update floor</button>");
-    write("</form>");
-
-    write("<p class='muted'>A REVIEW badge is an accounting flag, not an accusation. ");
-    write("Unresolved or missing-cache items remain visible but are excluded from the Meat estimate.</p>");
-    write("</section>");
-
-    write("<section class='card'>");
-    write("<h2>Player index</h2>");
     if (count(ranked_ids) == 0) {
-        write("<p class='muted'>No player-attributed rows were parsed.</p>");
+        write("<section class='chart-section'><div class='chart-shell'><h2>Stash withdrawal line</h2><p class='muted'>No player-attributed rows were parsed.</p></div></section>");
     } else {
-        write("<div class='grid'>");
-        foreach i, id in ranked_ids {
-            player_summary p = players[id];
-            write("<div class='stat'><a href='#player-" + id + "'>" + safe(p.name) + "</a>");
-            write("<br><span class='num'>" + meat(p.taken_value) + " Meat taken</span>");
-            if (p.taken_value >= threshold && p.taken_value > 0.0) write(" <span class='pill'>REVIEW</span>");
-            write("</div>");
-        }
-        write("</div>");
+        write_withdrawal_chart(ranked_ids, threshold);
     }
-    write("</section>");
+
+    write("<section class='card'>");
+    write("<div class='section-head'><div class='eyebrow'>Review threshold</div><div>");
+    write("<h2>" + meat(threshold) + " Meat</h2>");
+    write("<p>The larger of your configured floor and 4x the median nonzero player withdrawal total. If fewer than three players have priced withdrawals, the configured floor is used.</p>");
+    write("<form class='threshold-form' method='GET' action='clan_log.php'>");
+    write("<label for='floor'>Configured floor</label><input id='floor' name='floor' value='" + meat(floor_value) + "' size='14'> ");
+    write("<button class='button' type='submit'>Update floor</button>");
+    write("</form>");
+    write("<p class='muted'>A REVIEW marker is an accounting flag, not an accusation. Unresolved or missing-cache items stay visible but are excluded from the Meat estimate.</p>");
+    write("</div></div></section>");
+
+    write("<div class='player-ledgers-head' id='player-ledgers'><div class='eyebrow'>Player ledgers</div><div><h2>Per-player activity</h2><p>The dropdown above is the player index; use it to filter the line, then jump directly to that member's ledger.</p></div></div>");
 
     foreach i, id in ranked_ids {
         write_player_card(id, players[id], threshold, max_taken);
     }
 
     write("<section class='card'>");
-    write("<h2>Audit files</h2>");
+    write("<div class='section-head'><div class='eyebrow'>Audit files</div><div><h2>Persistent records</h2>");
     write("<p>Per-player records: <code>data/clan_logs/player-&lt;id&gt;.tsv</code><br>");
     write("Current rollup: <code>data/clan_logs/index.tsv</code></p>");
     write("<p class='muted'>Git checkout installs an empty <code>data/clan_logs/</code> directory marker so the record path exists before first render.</p>");
-    write("</section>");
+    write("</div></div></section>");
 
     write("</div></body></html>");
 }
